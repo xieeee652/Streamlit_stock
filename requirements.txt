@@ -1,0 +1,6 @@
+streamlit>=1.32.0
+yfinance>=0.2.37
+pandas>=2.0.0
+streamlit-autorefresh>=1.0.1
+psycopg2-binary>=2.9.9
+tomli>=2.0.1; python_version < "3.11"

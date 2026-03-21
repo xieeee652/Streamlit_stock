@@ -1,0 +1,15 @@
+# Secrets - never commit these
+.streamlit/secrets.toml
+.env
+
+# SQLite (no longer used, but just in case)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Docker
