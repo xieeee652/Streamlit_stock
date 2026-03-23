@@ -1,4 +1,4 @@
-﻿"""
+"""
 Database layer - PostgreSQL (Supabase) backed portfolio persistence.
 Connection URL is read from st.secrets["DATABASE_URL"] (Streamlit Cloud)
 or the DATABASE_URL environment variable (local dev).
@@ -104,6 +104,19 @@ def init_db() -> None:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id         SERIAL PRIMARY KEY,
+                    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    ticker     TEXT    NOT NULL,
+                    trade_date DATE    NOT NULL,
+                    quantity   REAL    NOT NULL,
+                    price      REAL    NOT NULL,
+                    trade_type TEXT    NOT NULL DEFAULT 'buy'
+                )
+                """
+            )
 
 
 # -- User ---------------------------------------------------------------------
@@ -156,6 +169,108 @@ def delete_holding(user_id: int, ticker: str) -> None:
     with _conn() as con:
         with con.cursor() as cur:
             cur.execute(
+                "DELETE FROM transactions WHERE user_id = %s AND ticker = %s",
+                (user_id, ticker),
+            )
+            cur.execute(
                 "DELETE FROM holdings WHERE user_id = %s AND ticker = %s",
                 (user_id, ticker),
             )
+
+
+# -- Transactions -------------------------------------------------------------
+
+def _sync_holding_from_transactions(cur, user_id: int, ticker: str) -> None:
+    """Recalculate holding qty/avg_price from buy transactions; noop if no buys."""
+    cur.execute(
+        "SELECT quantity, price, trade_type FROM transactions WHERE user_id=%s AND ticker=%s",
+        (user_id, ticker),
+    )
+    rows = cur.fetchall()
+    buy_rows  = [(q, p) for q, p, tt in rows if tt == "buy"]
+    sell_rows = [(q, p) for q, p, tt in rows if tt == "sell"]
+
+    # If no buys, leave the holding untouched (managed via "Add Holding" form)
+    if not buy_rows:
+        return
+
+    buy_qty  = sum(q for q, p in buy_rows)
+    buy_cost = sum(q * p for q, p in buy_rows)
+    sell_qty = sum(q for q, p in sell_rows)
+    net_qty  = buy_qty - sell_qty
+    avg_price = buy_cost / buy_qty if buy_qty > 0 else 0.0
+
+    if net_qty <= 0:
+        cur.execute(
+            "DELETE FROM holdings WHERE user_id=%s AND ticker=%s",
+            (user_id, ticker),
+        )
+        return
+
+    cur.execute(
+        """
+        INSERT INTO holdings (user_id, ticker, quantity, avg_price)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (user_id, ticker) DO UPDATE SET
+            quantity  = EXCLUDED.quantity,
+            avg_price = EXCLUDED.avg_price
+        """,
+        (user_id, ticker, net_qty, avg_price),
+    )
+
+
+def add_transaction(
+    user_id: int, ticker: str, trade_date, quantity: float,
+    price: float, trade_type: str,
+) -> None:
+    with _conn() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO transactions (user_id, ticker, trade_date, quantity, price, trade_type)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (user_id, ticker, str(trade_date), quantity, price, trade_type),
+            )
+            _sync_holding_from_transactions(cur, user_id, ticker)
+
+
+def load_transactions(user_id: int, ticker: str = None) -> list:
+    """Return list of (id, ticker, trade_date, quantity, price, trade_type)."""
+    with _conn() as con:
+        with con.cursor() as cur:
+            if ticker:
+                cur.execute(
+                    """SELECT id, ticker, trade_date, quantity, price, trade_type
+                       FROM transactions WHERE user_id=%s AND ticker=%s
+                       ORDER BY trade_date DESC, id DESC""",
+                    (user_id, ticker),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, ticker, trade_date, quantity, price, trade_type
+                       FROM transactions WHERE user_id=%s
+                       ORDER BY trade_date DESC, id DESC""",
+                    (user_id,),
+                )
+            return cur.fetchall()
+
+
+def delete_transaction(txn_id: int, user_id: int):
+    """Delete a transaction, resync its holding. Returns affected ticker or None."""
+    with _conn() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "SELECT ticker FROM transactions WHERE id=%s AND user_id=%s",
+                (txn_id, user_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            ticker = row[0]
+            cur.execute(
+                "DELETE FROM transactions WHERE id=%s AND user_id=%s",
+                (txn_id, user_id),
+            )
+            _sync_holding_from_transactions(cur, user_id, ticker)
+            return ticker
