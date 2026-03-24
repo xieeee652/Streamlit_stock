@@ -5,3 +5,4 @@ streamlit-autorefresh>=1.0.1
 psycopg2-binary>=2.9.9
 tomli>=2.0.1; python_version < "3.11"
 plotly>=5.20.0
+curl_cffi>=0.7.0
