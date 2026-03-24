@@ -50,7 +50,7 @@ for key, default in {
     "portfolio": {},
     "cached_news": {},
     "news_portfolio_key": "",
-    "refresh_interval": 5,
+    "refresh_interval": 30,
     "lang": "zh",
     "last_prices": {},
     "last_currencies": {},
@@ -1418,7 +1418,7 @@ for _dc, (_lbl_key, _sub_rows, _empty_key) in zip(_d_cols, _detail_cols):
     with _dc:
         st.markdown(f"**{t(_lbl_key)}**")
         if _sub_rows:
-            st.dataframe(_make_styled_df(_sub_rows), use_container_width=True, hide_index=True)
+            st.dataframe(_make_styled_df(_sub_rows), width='stretch', hide_index=True)
         else:
             st.caption(t(_empty_key))
 
@@ -1684,7 +1684,7 @@ else:
                          spikethickness=1, spikedash="dot")
         fig.update_yaxes(gridcolor="rgba(255,255,255,0.04)",
                          showspikes=True, spikecolor="rgba(255,255,255,0.2)")
-        st.plotly_chart(fig, use_container_width=True, key="stock_chart")
+        st.plotly_chart(fig, width='stretch', key="stock_chart")
 
 # -- Pie charts ---------------------------------------------------------------
 st.markdown(f'<p class="section-title">{t("sec_pie")}</p>', unsafe_allow_html=True)
@@ -1790,7 +1790,7 @@ _pie_cols = st.columns(len(_pie_items))
 for _pc, (_pk, _pr, _ek) in zip(_pie_cols, _pie_items):
     with _pc:
         if _pr:
-            st.plotly_chart(_make_pie(_pr, t(_pk)), use_container_width=True, key=_pk)
+            st.plotly_chart(_make_pie(_pr, t(_pk)), width='stretch', key=_pk)
         else:
             st.caption(t(_ek))
 
@@ -1868,7 +1868,7 @@ _sec_cols = st.columns(len(_sec_items))
 for _sc, (_sk, _sr, _sek, _skey) in zip(_sec_cols, _sec_items):
     with _sc:
         if _sr:
-            st.plotly_chart(_make_sector_pie(_sr, t(_sk)), use_container_width=True, key=_skey)
+            st.plotly_chart(_make_sector_pie(_sr, t(_sk)), width='stretch', key=_skey)
         else:
             st.caption(t(_sek))
 
@@ -1921,7 +1921,7 @@ for _divc, (_dlbl, _drows, _dek, _dtot_key, _dccy) in zip(_div_cols, _div_items)
     with _divc:
         st.markdown(f"**{t(_dlbl)}**")
         if _drows:
-            st.dataframe(_make_div_df(_drows), use_container_width=True, hide_index=True)
+            st.dataframe(_make_div_df(_drows), width='stretch', hide_index=True)
             _ann_div = sum(
                 r["qty"] * ((_sd_info.get(r["sym"]) or {}).get("dividend_rate") or 0)
                 for r in _drows
@@ -1999,7 +1999,7 @@ else:
             )
             _pfig.update_xaxes(gridcolor="rgba(255,255,255,0.04)")
             _pfig.update_yaxes(gridcolor="rgba(255,255,255,0.04)")
-            st.plotly_chart(_pfig, use_container_width=True, key=f"perf_{_ccy}")
+            st.plotly_chart(_pfig, width='stretch', key=f"perf_{_ccy}")
 
 # -- Transaction History -------------------------------------------------------
 st.markdown(f'<p class="section-title">{t("trans_history")}</p>', unsafe_allow_html=True)
