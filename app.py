@@ -379,7 +379,11 @@ def _fetch_fx_rate(pair: str) -> Optional[float]:
     try:
         data = yf.download(pair, period="5d", interval="1d", progress=False, auto_adjust=True)
         if not data.empty:
-            return float(data["Close"].dropna().iloc[-1])
+            val = data["Close"].dropna().iloc[-1]
+            # squeeze Series to scalar (avoids FutureWarning on newer pandas)
+            if hasattr(val, "iloc"):
+                val = val.iloc[0]
+            return float(val)
         return float(yf.Ticker(pair).fast_info.last_price or 0) or None
     except Exception:
         return None
