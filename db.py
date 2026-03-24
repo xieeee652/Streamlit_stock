@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import psycopg2
+import psycopg2.pool
 
 
 def _read_secrets_toml() -> dict:
@@ -67,10 +68,22 @@ def _db_params() -> dict:
     )
 
 
+_pool = None
+
+
+def _get_pool():
+    """Return a lazily-initialized connection pool (singleton)."""
+    global _pool
+    if _pool is None:
+        params = _db_params()
+        _pool = psycopg2.pool.ThreadedConnectionPool(1, 5, **params)
+    return _pool
+
+
 @contextmanager
 def _conn():
-    params = _db_params()
-    con = psycopg2.connect(**params)
+    pool = _get_pool()
+    con = pool.getconn()
     try:
         yield con
         con.commit()
@@ -78,7 +91,7 @@ def _conn():
         con.rollback()
         raise
     finally:
-        con.close()
+        pool.putconn(con)
 
 
 def init_db() -> None:
@@ -114,6 +127,18 @@ def init_db() -> None:
                     quantity   REAL    NOT NULL,
                     price      REAL    NOT NULL,
                     trade_type TEXT    NOT NULL DEFAULT 'buy'
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS price_alerts (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    ticker      TEXT    NOT NULL,
+                    target_price REAL,
+                    stop_price   REAL,
+                    UNIQUE (user_id, ticker)
                 )
                 """
             )
@@ -274,3 +299,41 @@ def delete_transaction(txn_id: int, user_id: int):
             )
             _sync_holding_from_transactions(cur, user_id, ticker)
             return ticker
+
+
+# -- Price Alerts --------------------------------------------------------------
+
+def load_price_alerts(user_id: int) -> dict:
+    """Return {ticker: {target_price, stop_price}}."""
+    with _conn() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "SELECT ticker, target_price, stop_price FROM price_alerts WHERE user_id = %s",
+                (user_id,),
+            )
+            rows = cur.fetchall()
+    return {r[0]: {"target_price": r[1], "stop_price": r[2]} for r in rows}
+
+
+def upsert_price_alert(user_id: int, ticker: str, target_price: float = None, stop_price: float = None) -> None:
+    with _conn() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO price_alerts (user_id, ticker, target_price, stop_price)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id, ticker) DO UPDATE SET
+                    target_price = EXCLUDED.target_price,
+                    stop_price   = EXCLUDED.stop_price
+                """,
+                (user_id, ticker, target_price, stop_price),
+            )
+
+
+def delete_price_alert(user_id: int, ticker: str) -> None:
+    with _conn() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "DELETE FROM price_alerts WHERE user_id = %s AND ticker = %s",
+                (user_id, ticker),
+            )

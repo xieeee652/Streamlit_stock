@@ -1,7 +1,9 @@
 import re
 import uuid
 from collections import defaultdict
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
+from html import escape as html_escape
 from typing import Optional
 import json
 
@@ -14,7 +16,8 @@ from streamlit_autorefresh import st_autorefresh
 
 from db import (
     add_transaction, delete_holding, delete_transaction,
-    find_or_create_user, init_db, load_holdings, load_transactions, upsert_holding,
+    delete_price_alert, find_or_create_user, init_db, load_holdings,
+    load_price_alerts, load_transactions, upsert_holding, upsert_price_alert,
 )
 
 # -- Init DB (once per server session, not on every rerun) --------------------
@@ -49,6 +52,8 @@ for key, default in {
     "news_portfolio_key": "",
     "refresh_interval": 5,
     "lang": "zh",
+    "last_prices": {},
+    "last_currencies": {},
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -82,13 +87,16 @@ _LANG: dict = {
         "remove_btn": "🗑️ 移除",
         "refresh_title": "⏱️ 自動更新",
         "refresh_label": "股價更新間隔（秒）",
-        "refresh_help": "最小 1 秒，頻繁請求可能觸發 Yahoo Finance 限速",
+        "refresh_help": "最小 5 秒，頻繁請求可能觸發 API 限速",
         "id_caption": "請將此頁面網址加入書籤以保存你的持倉",
         "lang_toggle": "🌐 English",
         "app_title": "📈 股票持倉追蹤",
         "empty_info": "👈 請在側邊欄新增持股，以檢視持倉概覽與新聞",
         "supported_formats": "**支援格式：**\n| 市場 | 範例 |\n|------|------|\n| 美股 | `AAPL`, `TSLA`, `NVDA` |\n| 台股 | `0050`, `2330`, `2317` |\n| 港股 | `0700.HK` |",
         "fetching_prices": "正在取得最新股價…",
+        "market_tw_only": "🇹🇼 台股交易時段，略過美股（使用快取）",
+        "market_us_only": "🇺🇸 美股交易時段，略過台股（使用快取）",
+        "market_both": "🌐 更新所有持股",
         "fetching_news": "正在取得新聞…",
         "fetch_failed": "⚠️ 無法取得資料：{}",
         "sec_overview": "💼 持倉總覽",
@@ -105,10 +113,15 @@ _LANG: dict = {
         "col_mkt_val": "市值",
         "col_pnl": "損益",
         "col_pnl_pct": "損益%",
+        "col_52w_high": "52週高",
+        "col_52w_low": "52週低",
+        "col_52w_range": "位置",
         "tw_stocks": "🇹🇼 台股（TWD）",
         "us_stocks": "🇺🇸 美股（USD）",
+        "hk_stocks": "🇭🇰 港股（HKD）",
         "no_tw": "尚無台股持倉",
         "no_us": "尚無美股持倉",
+        "no_hk": "尚無港股持倉",
         "chart_sym_label": "選擇股票",
         "chart_period_label": "期間",
         "chart_period_opts": ["1週", "1個月", "3個月", "6個月", "1年", "2年"],
@@ -120,8 +133,10 @@ _LANG: dict = {
         "bb_mid": "BB中軌",
         "pie_tw": "🇹🇼 台股配置",
         "pie_us": "🇺🇸 美股配置",
+        "pie_hk": "🇭🇰 港股配置",
         "news_tw": "**🇹🇼 台股新聞**",
         "news_us": "**🇺🇸 美股新聞**",
+        "news_hk": "**🇭🇰 港股新聞**",
         "no_news_tab": "尚無相關新聞",
         "news_not_found": "找不到新聞，請確認股票代號是否正確",
         "footer_time": "⏰ 最後更新：{}  （每 {}s 自動更新）",
@@ -139,6 +154,7 @@ _LANG: dict = {
         "perf_period_vals": ["1mo", "3mo", "6mo", "1y"],
         "perf_tw_label": "台股市值 (TWD)",
         "perf_us_label": "美股市值 (USD)",
+        "perf_hk_label": "港股市值 (HKD)",
         "perf_cost": "成本",
         "perf_fetching": "載入投組走勢…",
         "perf_no_data": "無法取得投組歷史資料",
@@ -167,6 +183,7 @@ _LANG: dict = {
         "sec_sector": "🏭 類股/板塊分佈",
         "sector_tw": "🇹🇼 台股板塊分佈",
         "sector_us": "🇺🇸 美股板塊分佈",
+        "sector_hk": "🇭🇰 港股板塊分佈",
         "sector_unknown": "未知",
         "sector_fetching": "載入板塊資料…",
         "sector_label": "產業",
@@ -178,6 +195,21 @@ _LANG: dict = {
         "div_col_annual_income": "預期年化股息收入",
         "div_tw_total": "台股合計預期年化股息 (TWD)",
         "div_us_total": "美股合計預期年化股息 (USD)",
+        "div_hk_total": "港股合計預期年化股息 (HKD)",
+        # Feature 5: Price alerts
+        "alert_title": "🎯 目標價 / 停損價",
+        "alert_select": "選擇股票",
+        "alert_target_label": "目標出價（0 = 不設定）",
+        "alert_stop_label": "停損價（0 = 不設定）",
+        "alert_save_btn": "📌 設定",
+        "alert_saved": "已設定 {} 的提醒",
+        "alert_clear_btn": "❌ 清除提醒",
+        "alert_cleared": "已清除 {} 的提醒",
+        "alert_target_hit": "🚀 {sym} 已達目標價！現價 {price:.2f} ≥ 目標 {target:.2f}",
+        "alert_stop_hit": "⚠️ {sym} 已觸停損！現價 {price:.2f} ≤ 停損 {stop:.2f}",
+        "alert_current": "目前設定",
+        "alert_target_short": "目標",
+        "alert_stop_short": "停損",
     },
     "en": {
         "sidebar_title": "📋 My Holdings",
@@ -199,13 +231,16 @@ _LANG: dict = {
         "remove_btn": "🗑️ Remove",
         "refresh_title": "⏱️ Auto Refresh",
         "refresh_label": "Price refresh interval (seconds)",
-        "refresh_help": "Minimum 1s — frequent requests may trigger Yahoo Finance rate limits",
+        "refresh_help": "Minimum 5s — frequent requests may trigger API rate limits",
         "id_caption": "Bookmark this page URL to keep your portfolio.",
         "lang_toggle": "🌐 中文",
         "app_title": "📈 Stock Portfolio Tracker",
         "empty_info": "👈 Add holdings in the sidebar to view your portfolio summary and news.",
         "supported_formats": "**Supported formats:**\n| Market | Example |\n|--------|---------|\n| US     | `AAPL`, `TSLA`, `NVDA` |\n| Taiwan | `0050`, `2330`, `2317` |\n| HK     | `0700.HK` |",
         "fetching_prices": "Fetching latest prices…",
+        "market_tw_only": "🇹🇼 TW trading session — US prices from cache",
+        "market_us_only": "🇺🇸 US trading session — TW prices from cache",
+        "market_both": "🌐 Updating all holdings",
         "fetching_news": "Fetching news…",
         "fetch_failed": "⚠️ Failed to fetch data: {}",
         "sec_overview": "💼 Portfolio Overview",
@@ -222,10 +257,15 @@ _LANG: dict = {
         "col_mkt_val": "Market Value",
         "col_pnl": "P&L",
         "col_pnl_pct": "P&L %",
+        "col_52w_high": "52W High",
+        "col_52w_low": "52W Low",
+        "col_52w_range": "Range",
         "tw_stocks": "🇹🇼 TW Stocks (TWD)",
         "us_stocks": "🇺🇸 US Stocks (USD)",
+        "hk_stocks": "🇭🇰 HK Stocks (HKD)",
         "no_tw": "No TW holdings",
         "no_us": "No US holdings",
+        "no_hk": "No HK holdings",
         "chart_sym_label": "Select Stock",
         "chart_period_label": "Period",
         "chart_period_opts": ["1W", "1M", "3M", "6M", "1Y", "2Y"],
@@ -237,8 +277,10 @@ _LANG: dict = {
         "bb_mid": "BB Mid",
         "pie_tw": "🇹🇼 TW Allocation",
         "pie_us": "🇺🇸 US Allocation",
+        "pie_hk": "🇭🇰 HK Allocation",
         "news_tw": "**🇹🇼 TW News**",
         "news_us": "**🇺🇸 US News**",
+        "news_hk": "**🇭🇰 HK News**",
         "no_news_tab": "No news available",
         "news_not_found": "No news found. Please check that the ticker symbols are correct.",
         "footer_time": "⏰ Last updated: {}  (auto-refresh every {}s)",
@@ -256,6 +298,7 @@ _LANG: dict = {
         "perf_period_vals": ["1mo", "3mo", "6mo", "1y"],
         "perf_tw_label": "TW Value (TWD)",
         "perf_us_label": "US Value (USD)",
+        "perf_hk_label": "HK Value (HKD)",
         "perf_cost": "Cost",
         "perf_fetching": "Loading portfolio performance…",
         "perf_no_data": "Unable to fetch portfolio history",
@@ -284,6 +327,7 @@ _LANG: dict = {
         "sec_sector": "🏭 Sector Distribution",
         "sector_tw": "🇹🇼 TW Sector Breakdown",
         "sector_us": "🇺🇸 US Sector Breakdown",
+        "sector_hk": "🇭🇰 HK Sector Breakdown",
         "sector_unknown": "Unknown",
         "sector_fetching": "Loading sector data…",
         "sector_label": "Sectors",
@@ -295,6 +339,21 @@ _LANG: dict = {
         "div_col_annual_income": "Expected Annual Div.",
         "div_tw_total": "TW Total Expected Annual Dividend (TWD)",
         "div_us_total": "US Total Expected Annual Dividend (USD)",
+        "div_hk_total": "HK Total Expected Annual Dividend (HKD)",
+        # Feature 5: Price alerts
+        "alert_title": "🎯 Target / Stop-Loss",
+        "alert_select": "Select ticker",
+        "alert_target_label": "Target price (0 = not set)",
+        "alert_stop_label": "Stop-loss price (0 = not set)",
+        "alert_save_btn": "📌 Set Alert",
+        "alert_saved": "Alert set for {}",
+        "alert_clear_btn": "❌ Clear Alert",
+        "alert_cleared": "Alert cleared for {}",
+        "alert_target_hit": "🚀 {sym} hit target! Price {price:.2f} ≥ Target {target:.2f}",
+        "alert_stop_hit": "⚠️ {sym} hit stop-loss! Price {price:.2f} ≤ Stop {stop:.2f}",
+        "alert_current": "Current alerts",
+        "alert_target_short": "Target",
+        "alert_stop_short": "Stop",
     },
 }
 
@@ -318,7 +377,7 @@ def normalize_ticker(raw: str) -> str:
 def _fetch_fx_rate(pair: str) -> Optional[float]:
     """Fetch the latest price for a forex pair (e.g. 'USDTWD=X')."""
     try:
-        data = yf.download(pair, period="1d", interval="1m", progress=False, auto_adjust=True)
+        data = yf.download(pair, period="5d", interval="1d", progress=False, auto_adjust=True)
         if not data.empty:
             return float(data["Close"].dropna().iloc[-1])
         return float(yf.Ticker(pair).fast_info.last_price or 0) or None
@@ -333,7 +392,6 @@ def _fetch_portfolio_history(holdings_json: str, period_str: str) -> dict:
     holdings_json: JSON list of {sym, qty, cost, currency}
     Returns {currency: {dates, values, total_cost}}
     """
-    import json
     holdings = json.loads(holdings_json)
     if not holdings:
         return {}
@@ -395,27 +453,145 @@ def _fetch_portfolio_history(holdings_json: str, period_str: str) -> dict:
     return result
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_resource
+def _fugle_client():
+    """Return a Fugle RestClient if API key is configured, else None."""
+    import base64
+    try:
+        import streamlit as _st
+        raw = _st.secrets.get("fugle_api_key", "") or ""
+    except Exception:
+        raw = ""
+    if not raw:
+        return None
+    # The key may be stored base64-encoded; try to decode it.
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8").strip()
+        api_key = decoded.split()[0]   # take the first token if space-separated
+    except Exception:
+        api_key = raw.strip()
+    try:
+        from fugle_marketdata import RestClient
+        return RestClient(api_key=api_key)
+    except Exception:
+        return None
+
+
+def _fetch_tw_prices_fugle(syms: list) -> dict:
+    """
+    Fetch last prices for a list of .TW symbols using Fugle REST API.
+    Returns {sym: price}. Missing entries mean Fugle failed for that symbol.
+    """
+    client = _fugle_client()
+    if client is None:
+        return {}
+
+    def _fetch_one(sym):
+        fugle_sym = sym.removesuffix(".TW")
+        try:
+            data = client.stock.intraday.quote(symbol=fugle_sym)
+            price = (
+                (data.get("lastTrade") or {}).get("price")
+                or data.get("closePrice")
+                or data.get("previousClose")
+                or 0.0
+            )
+            return (sym, float(price)) if price else None
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=min(len(syms), 6)) as pool:
+        results = pool.map(_fetch_one, syms)
+    return {sym: p for sym, p in (r for r in results if r) if p > 0}
+
+
+def _finnhub_api_key() -> str:
+    """Return Finnhub API key from st.secrets or empty string."""
+    try:
+        import streamlit as _st
+        return _st.secrets.get("finnhub_api_key", "") or ""
+    except Exception:
+        return ""
+
+
+def _fetch_us_prices_finnhub(syms: list) -> dict:
+    """
+    Fetch last prices for US tickers using Finnhub /quote endpoint.
+    Returns {sym: price}. Falls back gracefully on error.
+    """
+    import urllib.request as _ur
+    import urllib.parse  as _up
+    key = _finnhub_api_key()
+    if not key:
+        return {}
+
+    def _fetch_one(sym):
+        try:
+            url = f"https://finnhub.io/api/v1/quote?symbol={_up.quote(sym)}&token={key}"
+            req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with _ur.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+            price = data.get("c") or data.get("pc") or 0.0
+            return (sym, float(price)) if price else None
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=min(len(syms), 6)) as pool:
+        results = pool.map(_fetch_one, syms)
+    return {sym: p for sym, p in (r for r in results if r) if p > 0}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def _fetch_sector_dividend_info(syms_json: str) -> dict:
     """
-    Fetch sector and dividend info for a list of tickers (cached 1 hour).
+    Fetch sector and dividend info for a list of tickers (cached 24 hours).
     Returns {sym: {"sector": str|None, "dividend_yield": float|None, "dividend_rate": float|None}}
-    dividend_yield: annual yield as decimal (e.g. 0.015 = 1.5%)
-    dividend_rate:  annual dividend per share in local currency
     """
     syms = json.loads(syms_json)
-    result = {}
-    for sym in syms:
+
+    def _fetch_one(sym):
         try:
             info = yf.Ticker(sym).info
-            result[sym] = {
+            return sym, {
                 "sector": info.get("sector") or None,
                 "dividend_yield": info.get("dividendYield") or None,
                 "dividend_rate": info.get("dividendRate") or None,
+                "52w_high": info.get("fiftyTwoWeekHigh") or None,
+                "52w_low": info.get("fiftyTwoWeekLow") or None,
             }
         except Exception:
-            result[sym] = {"sector": None, "dividend_yield": None, "dividend_rate": None}
-    return result
+            return sym, {"sector": None, "dividend_yield": None, "dividend_rate": None, "52w_high": None, "52w_low": None}
+
+    with ThreadPoolExecutor(max_workers=min(len(syms), 8)) as pool:
+        results = pool.map(_fetch_one, syms)
+    return dict(results)
+
+
+def _market_active_tickers(all_syms: list) -> list:
+    """
+    Return the subset of tickers whose market is likely open right now.
+    Uses Taiwan time (UTC+8) as reference:
+      - TW/HK session: 08:30–14:00 CST
+      - US session:    21:30–05:30 CST (covers EST and EDT)
+    When only one market is open, the other market's tickers are skipped
+    (caller should use cached prices for them instead).
+    """
+    tw_tz = timezone(timedelta(hours=8))
+    now   = datetime.now(tw_tz)
+    if now.weekday() >= 5:          # weekend — nothing is trading
+        return []
+    h = now.hour + now.minute / 60  # decimal hour in CST
+    tw_syms = [s for s in all_syms if s.endswith(".TW") or s.endswith(".HK")]
+    us_syms = [s for s in all_syms if not s.endswith(".TW") and not s.endswith(".HK")]
+    # Only narrow down when we have both types in the portfolio
+    if tw_syms and us_syms:
+        tw_open = 8.5 <= h <= 14.0
+        us_open = h >= 21.5 or h <= 5.5
+        if tw_open and not us_open:
+            return tw_syms
+        if us_open and not tw_open:
+            return us_syms
+    return all_syms
 
 
 # =============================================================================
@@ -740,7 +916,7 @@ with st.sidebar:
                                      horizontal=True, key="txn_type_radio")
             txn_date  = st.date_input(t("trans_date_label"), value=datetime.now().date())
             txn_qty   = st.number_input(t("trans_qty_label"),  min_value=0.01, step=1.0, value=1.0)
-            txn_price = st.number_input(t("trans_price_label"), min_value=0.0, step=0.01, value=0.0)
+            txn_price = st.number_input(t("trans_price_label"), min_value=0.01, step=0.01, value=1.0)
             txn_submit = st.form_submit_button(t("trans_submit_btn"))
         if txn_submit and txn_sym_input.strip():
             _sym       = normalize_ticker(txn_sym_input.strip())
@@ -753,16 +929,61 @@ with st.sidebar:
                 st.session_state.portfolio = load_holdings(st.session_state.user_id)
                 st.session_state.cached_news = {}
                 st.session_state.news_portfolio_key = ""
+                st.session_state.pop("cached_txns", None)
                 st.success(t("trans_added").format(_sym, t("trans_buy_label") if _ttype == "buy" else t("trans_sell_label"), txn_qty, txn_price))
                 st.rerun()
+
+    # -- Price Alerts form --
+    if st.session_state.portfolio:
+        st.divider()
+        st.subheader(t("alert_title"))
+        _alert_sym = st.selectbox(t("alert_select"), list(st.session_state.portfolio), key="alert_sym")
+        _existing_alerts = st.session_state.get("cached_alerts") or load_price_alerts(st.session_state.user_id)
+        _cur_alert = _existing_alerts.get(_alert_sym, {})
+        with st.form("alert_form", clear_on_submit=False):
+            _alert_target = st.number_input(
+                t("alert_target_label"), min_value=0.0, step=0.01,
+                value=float(_cur_alert.get("target_price") or 0),
+            )
+            _alert_stop = st.number_input(
+                t("alert_stop_label"), min_value=0.0, step=0.01,
+                value=float(_cur_alert.get("stop_price") or 0),
+            )
+            _alert_save = st.form_submit_button(t("alert_save_btn"))
+        if _alert_save:
+            upsert_price_alert(
+                st.session_state.user_id, _alert_sym,
+                _alert_target if _alert_target > 0 else None,
+                _alert_stop if _alert_stop > 0 else None,
+            )
+            st.success(t("alert_saved").format(_alert_sym))
+            st.session_state.pop("cached_alerts", None)
+            st.rerun()
+        if _cur_alert.get("target_price") or _cur_alert.get("stop_price"):
+            if st.button(t("alert_clear_btn"), key="alert_clear_btn"):
+                delete_price_alert(st.session_state.user_id, _alert_sym)
+                st.success(t("alert_cleared").format(_alert_sym))
+                st.session_state.pop("cached_alerts", None)
+                st.rerun()
+        # Show current alerts summary
+        if _existing_alerts:
+            st.caption(f"📋 {t('alert_current')}:")
+            for _a_sym, _a_val in _existing_alerts.items():
+                _parts = []
+                if _a_val.get("target_price"):
+                    _parts.append(f"🎯{t('alert_target_short')} {_a_val['target_price']:.2f}")
+                if _a_val.get("stop_price"):
+                    _parts.append(f"🛑{t('alert_stop_short')} {_a_val['stop_price']:.2f}")
+                if _parts:
+                    st.caption(f"  **{_a_sym}** — {' / '.join(_parts)}")
 
     st.divider()
     st.subheader(t("refresh_title"))
     st.session_state.refresh_interval = st.slider(
         t("refresh_label"),
-        min_value=1,
+        min_value=5,
         max_value=60,
-        value=st.session_state.refresh_interval,
+        value=max(5, st.session_state.refresh_interval),
         help=t("refresh_help"),
     )
     st.divider()
@@ -787,57 +1008,96 @@ if current_key != st.session_state.news_portfolio_key:
     st.session_state.cached_news = {}
     st.session_state.news_portfolio_key = current_key
 
+_all_tickers   = list(st.session_state.portfolio.keys())
+_fetch_tickers = _market_active_tickers(_all_tickers)
+_skip_tickers  = set(_all_tickers) - set(_fetch_tickers)
+
+# Show which market session is active
+if _skip_tickers:
+    _tw_active = any(s.endswith(".TW") or s.endswith(".HK") for s in _fetch_tickers)
+    st.caption(t("market_tw_only") if _tw_active else t("market_us_only"))
+else:
+    st.caption(t("market_both"))
+
 with st.spinner(t("fetching_prices")):
-    tickers = list(st.session_state.portfolio.keys())
-    # Batch-fetch all prices in one API call
-    try:
-        raw = yf.download(
-            tickers,
-            period="1d",
-            interval="1m",
-            progress=False,
-            auto_adjust=True,
-            group_by="ticker",
-        )
-        # Build a {sym: last_close} map from the batch result
-        batch_prices: dict[str, float] = {}
-        if len(tickers) == 1:
-            sym = tickers[0]
+    batch_prices: dict[str, float] = {}
+    if _fetch_tickers:
+        # --- Fugle for TW stocks (real-time) ---------------------------------
+        _tw_fetch = [s for s in _fetch_tickers if s.endswith(".TW")]
+        if _tw_fetch:
+            batch_prices.update(_fetch_tw_prices_fugle(_tw_fetch))
+
+        # --- Finnhub for US stocks (real-time) --------------------------------
+        _us_fetch = [s for s in _fetch_tickers
+                     if not s.endswith(".TW") and not s.endswith(".HK")]
+        if _us_fetch:
+            batch_prices.update(_fetch_us_prices_finnhub(_us_fetch))
+
+        # --- yfinance fallback for HK + anything Fugle/Finnhub missed --------
+        _yf_needed = [s for s in _fetch_tickers if s not in batch_prices]
+        if _yf_needed:
             try:
-                batch_prices[sym] = float(raw["Close"].dropna().iloc[-1])
+                _raw = yf.download(
+                    _yf_needed,
+                    period="1d",
+                    interval="1m",
+                    progress=False,
+                    auto_adjust=True,
+                    group_by="ticker",
+                )
+                if len(_yf_needed) == 1:
+                    _s = _yf_needed[0]
+                    try:
+                        batch_prices[_s] = float(_raw["Close"].dropna().iloc[-1])
+                    except Exception:
+                        pass
+                else:
+                    for _s in _yf_needed:
+                        try:
+                            batch_prices[_s] = float(_raw[_s]["Close"].dropna().iloc[-1])
+                        except Exception:
+                            pass
             except Exception:
                 pass
-        else:
-            for sym in tickers:
-                try:
-                    batch_prices[sym] = float(raw[sym]["Close"].dropna().iloc[-1])
-                except Exception:
-                    pass
-    except Exception:
-        batch_prices = {}
 
     for sym, holding in st.session_state.portfolio.items():
-        price = batch_prices.get(sym, 0.0)
-        currency = "N/A"
+        # Use fresh price if fetched; fall back to session-state cache for skipped tickers
+        if sym in batch_prices:
+            price = batch_prices[sym]
+        elif sym in _skip_tickers and sym in st.session_state.last_prices:
+            price = st.session_state.last_prices[sym]
+        else:
+            price = 0.0
+
+        # Hard-code currencies by suffix to avoid extra API calls
+        currency = st.session_state.last_currencies.get(sym, "N/A")
+        if currency == "N/A":
+            if sym.endswith(".TW"):
+                currency = "TWD"
+            elif sym.endswith(".HK"):
+                currency = "HKD"
+            else:
+                currency = "USD"
+
         if price == 0.0:
-            # Fallback to fast_info for currency and price
             try:
                 fi = yf.Ticker(sym).fast_info
                 price = fi.last_price or 0.0
-                currency = fi.currency or "N/A"
             except Exception as e:
-                fetch_errors.append(f"{sym}: {e}")
-        else:
-            try:
-                currency = yf.Ticker(sym).fast_info.currency or "N/A"
-            except Exception:
-                pass
+                if sym not in _skip_tickers:
+                    fetch_errors.append(f"{sym}: {e}")
 
-        qty = holding["quantity"]
-        avg_p = holding["avg_price"]
+        # Persist to session-state cache
+        if price > 0:
+            st.session_state.last_prices[sym] = price
+        if currency != "N/A":
+            st.session_state.last_currencies[sym] = currency
+
+        qty     = holding["quantity"]
+        avg_p   = holding["avg_price"]
         mkt_val = price * qty
-        cost = avg_p * qty if avg_p > 0 else None
-        pnl = (mkt_val - cost) if cost else None
+        cost    = avg_p * qty if avg_p > 0 else None
+        pnl     = (mkt_val - cost) if cost else None
         pnl_pct = (pnl / cost * 100) if cost else None
 
         rows.append({
@@ -928,16 +1188,39 @@ def _fetch_news(sym: str) -> list:
     return articles[:20]
 
 if st.session_state.portfolio:
-    missing_syms = [sym for sym in st.session_state.portfolio if sym not in st.session_state.cached_news]
+    # Only fetch news for the currently-active market session
+    _active_news_syms = set(_fetch_tickers)
+    missing_syms = [
+        sym for sym in st.session_state.portfolio
+        if sym not in st.session_state.cached_news and sym in _active_news_syms
+    ]
     if missing_syms:
         with st.spinner(t("fetching_news")):
-            for sym in missing_syms:
-                items = _fetch_news(sym)
+            with ThreadPoolExecutor(max_workers=min(len(missing_syms), 6)) as pool:
+                news_results = list(pool.map(lambda s: (s, _fetch_news(s)), missing_syms))
+            for sym, items in news_results:
                 if items:
                     st.session_state.cached_news[sym] = items
 
 for err in fetch_errors:
     st.warning(t("fetch_failed").format(err))
+
+# -- Price Alert Banners -------------------------------------------------------
+if "cached_alerts" not in st.session_state:
+    st.session_state.cached_alerts = load_price_alerts(st.session_state.user_id)
+_price_alerts = st.session_state.cached_alerts
+if _price_alerts and rows:
+    _row_prices = {r["sym"]: r["price"] for r in rows if r["price"] > 0}
+    for _pa_sym, _pa_vals in _price_alerts.items():
+        _pa_price = _row_prices.get(_pa_sym)
+        if not _pa_price:
+            continue
+        if _pa_vals.get("target_price") and _pa_price >= _pa_vals["target_price"]:
+            st.success(t("alert_target_hit").format(
+                sym=_pa_sym, price=_pa_price, target=_pa_vals["target_price"]))
+        if _pa_vals.get("stop_price") and _pa_price <= _pa_vals["stop_price"]:
+            st.error(t("alert_stop_hit").format(
+                sym=_pa_sym, price=_pa_price, stop=_pa_vals["stop_price"]))
 
 # -- Portfolio summary --------------------------------------------------------
 st.markdown(f'<p class="section-title">{t("sec_overview")}</p>', unsafe_allow_html=True)
@@ -1010,10 +1293,12 @@ if _has_twd and _has_usd:
             _grand_val  = _twd_val  + _usd_val  * _usdtwd
             _grand_cost = _twd_cost + _usd_cost * _usdtwd
             _grand_pnl  = _twd_pnl  + _usd_pnl  * _usdtwd
-        else:
+        elif _usdtwd > 0:
             _grand_val  = _twd_val  / _usdtwd + _usd_val
             _grand_cost = _twd_cost / _usdtwd + _usd_cost
             _grand_pnl  = _twd_pnl  / _usdtwd + _usd_pnl
+        else:
+            _grand_val = _grand_cost = _grand_pnl = 0
         _grand_pnl_pct = (_grand_pnl / _grand_cost * 100) if _grand_cost > 0 else None
         _arrow    = "▲" if _grand_pnl >= 0 else "▼"
         _pnl_cls  = "fx-pnl-p" if _grand_pnl >= 0 else "fx-pnl-n"
@@ -1035,6 +1320,11 @@ if _has_twd and _has_usd:
 </div>""", unsafe_allow_html=True)
     else:
         st.caption(t("fx_unavailable"))
+
+# -- Fetch sector/dividend/52w info (shared by table, sector pie, dividend) ----
+_syms_for_sd = json.dumps(sorted(list(st.session_state.portfolio.keys())))
+with st.spinner(t("sector_fetching")):
+    _sd_info = _fetch_sector_dividend_info(_syms_for_sd)
 
 # -- Holdings table -----------------------------------------------------------
 st.markdown(f'<p class="section-title">{t("sec_detail")}</p>', unsafe_allow_html=True)
@@ -1060,13 +1350,27 @@ def _make_styled_df(subset_rows):
     col_mkt_val   = t("col_mkt_val")
     col_pnl       = t("col_pnl")
     col_pnl_pct   = t("col_pnl_pct")
+    col_52w_high  = t("col_52w_high")
+    col_52w_low   = t("col_52w_low")
+    col_52w_range = t("col_52w_range")
     data = []
     for r in subset_rows:
+        _sdi = _sd_info.get(r["sym"]) or {}
+        _hi  = _sdi.get("52w_high")
+        _lo  = _sdi.get("52w_low")
+        # Position within 52w range as percentage
+        if _hi and _lo and _hi != _lo and r["price"] > 0:
+            _range_pct = (r["price"] - _lo) / (_hi - _lo) * 100
+        else:
+            _range_pct = float("nan")
         data.append({
             col_ticker:    r["sym"],
             col_shares:    r["qty"],
             col_avg_price: r["avg_p"] if r["avg_p"] > 0 else float("nan"),
             col_cur_price: r["price"],
+            col_52w_high:  _hi if _hi else float("nan"),
+            col_52w_low:   _lo if _lo else float("nan"),
+            col_52w_range: _range_pct,
             col_mkt_val:   r["mkt_val"],
             col_pnl:       r["pnl"] if r["pnl"] is not None else float("nan"),
             col_pnl_pct:   r["pnl_pct"] if r["pnl_pct"] is not None else float("nan"),
@@ -1078,35 +1382,45 @@ def _make_styled_df(subset_rows):
         .format({
             col_avg_price: lambda x: f"{x:.2f}" if not pd.isna(x) else "—",
             col_cur_price: "{:.2f}",
+            col_52w_high:  lambda x: f"{x:.2f}" if not pd.isna(x) else "—",
+            col_52w_low:   lambda x: f"{x:.2f}" if not pd.isna(x) else "—",
+            col_52w_range: lambda x: f"{x:.0f}%" if not pd.isna(x) else "—",
             col_mkt_val:   "{:,.2f}",
             col_pnl:       lambda x: f"{x:+,.2f}" if not pd.isna(x) else "—",
             col_pnl_pct:   lambda x: f"{x:+.2f}%" if not pd.isna(x) else "—",
             col_shares:    "{:g}",
         })
         .set_properties(
-            subset=[col_shares, col_avg_price, col_cur_price, col_mkt_val, col_pnl, col_pnl_pct],
+            subset=[col_shares, col_avg_price, col_cur_price, col_mkt_val,
+                    col_pnl, col_pnl_pct, col_52w_high, col_52w_low, col_52w_range],
             **{"text-align": "right"},
         )
         .set_properties(subset=[col_ticker], **{"font-weight": "700"})
     )
 
 tw_rows = [r for r in rows if r["currency"] == "TWD"]
-us_rows = [r for r in rows if r["currency"] != "TWD"]
+us_rows = [r for r in rows if r["currency"] == "USD"]
+hk_rows = [r for r in rows if r["currency"] not in ("TWD", "USD")]
 
-col_tw, col_us = st.columns(2)
-with col_tw:
-    st.markdown(f"**{t('tw_stocks')}**")
-    if tw_rows:
-        st.dataframe(_make_styled_df(tw_rows), use_container_width=True, hide_index=True)
-    else:
-        st.caption(t("no_tw"))
+_detail_cols = []
+_detail_data = []
+if tw_rows:
+    _detail_cols.append(("tw_stocks", tw_rows, "no_tw"))
+if us_rows:
+    _detail_cols.append(("us_stocks", us_rows, "no_us"))
+if hk_rows:
+    _detail_cols.append(("hk_stocks", hk_rows, "no_hk"))
+if not _detail_cols:
+    _detail_cols = [("tw_stocks", [], "no_tw"), ("us_stocks", [], "no_us")]
 
-with col_us:
-    st.markdown(f"**{t('us_stocks')}**")
-    if us_rows:
-        st.dataframe(_make_styled_df(us_rows), use_container_width=True, hide_index=True)
-    else:
-        st.caption(t("no_us"))
+_d_cols = st.columns(len(_detail_cols))
+for _dc, (_lbl_key, _sub_rows, _empty_key) in zip(_d_cols, _detail_cols):
+    with _dc:
+        st.markdown(f"**{t(_lbl_key)}**")
+        if _sub_rows:
+            st.dataframe(_make_styled_df(_sub_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption(t(_empty_key))
 
 # -- Stock price chart (hybrid: plotly for TW/HK, TradingView for US) --------
 st.markdown(f'<p class="section-title">{t("sec_chart")}</p>', unsafe_allow_html=True)
@@ -1122,8 +1436,9 @@ _PERIOD_VALS = [
     ("2y",  "1wk"),
 ]
 
+@st.cache_data(ttl=86400, show_spinner=False)
 def _to_tv_symbol_us(sym: str) -> str:
-    """Return TradingView exchange:symbol for US tickers."""
+    """Return TradingView exchange:symbol for US tickers (cached 24h)."""
     try:
         exchange = getattr(yf.Ticker(sym).fast_info, "exchange", "") or ""
         tv_map = {
@@ -1160,6 +1475,7 @@ else:
 if not is_tw_or_hk:
     # ── TradingView for US stocks ────────────────────────────────────────────
     tv_sym = _to_tv_symbol_us(chart_sym)
+    _tv_sym_safe = json.dumps(tv_sym)
     components.html(
         f"""
         <div class="tradingview-widget-container" style="height:520px; width:100%;">
@@ -1169,7 +1485,7 @@ if not is_tw_or_hk:
             src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js"
             async>
           {{
-            "symbol":            "{tv_sym}",
+            "symbol":            {_tv_sym_safe},
             "interval":          "D",
             "timezone":          "America/New_York",
             "theme":             "dark",
@@ -1461,24 +1777,25 @@ def _make_pie(subset_rows, flag_title):
     )
     return fig
 
-pie_col_tw, pie_col_us = st.columns(2)
-with pie_col_tw:
-    if tw_rows:
-        st.plotly_chart(_make_pie(tw_rows, t("pie_tw")), use_container_width=True, key="pie_tw")
-    else:
-        st.caption(t("no_tw"))
-with pie_col_us:
-    if us_rows:
-        st.plotly_chart(_make_pie(us_rows, t("pie_us")), use_container_width=True, key="pie_us")
-    else:
-        st.caption(t("no_us"))
+_pie_items = []
+if tw_rows:
+    _pie_items.append(("pie_tw", tw_rows, "no_tw"))
+if us_rows:
+    _pie_items.append(("pie_us", us_rows, "no_us"))
+if hk_rows:
+    _pie_items.append(("pie_hk", hk_rows, "no_hk"))
+if not _pie_items:
+    _pie_items = [("pie_tw", [], "no_tw"), ("pie_us", [], "no_us")]
+_pie_cols = st.columns(len(_pie_items))
+for _pc, (_pk, _pr, _ek) in zip(_pie_cols, _pie_items):
+    with _pc:
+        if _pr:
+            st.plotly_chart(_make_pie(_pr, t(_pk)), use_container_width=True, key=_pk)
+        else:
+            st.caption(t(_ek))
 
 # -- Sector Distribution -------------------------------------------------------
 st.markdown(f'<p class="section-title">{t("sec_sector")}</p>', unsafe_allow_html=True)
-
-_syms_for_sd = json.dumps(sorted(list(st.session_state.portfolio.keys())))
-with st.spinner(t("sector_fetching")):
-    _sd_info = _fetch_sector_dividend_info(_syms_for_sd)
 
 _SECTOR_COLORS = {
     "Technology": "#7eb8f7",
@@ -1538,17 +1855,22 @@ def _make_sector_pie(subset_rows, title):
     return fig
 
 
-_sec_col_tw, _sec_col_us = st.columns(2)
-with _sec_col_tw:
-    if tw_rows:
-        st.plotly_chart(_make_sector_pie(tw_rows, t("sector_tw")), use_container_width=True, key="sector_pie_tw")
-    else:
-        st.caption(t("no_tw"))
-with _sec_col_us:
-    if us_rows:
-        st.plotly_chart(_make_sector_pie(us_rows, t("sector_us")), use_container_width=True, key="sector_pie_us")
-    else:
-        st.caption(t("no_us"))
+_sec_items = []
+if tw_rows:
+    _sec_items.append(("sector_tw", tw_rows, "no_tw", "sector_pie_tw"))
+if us_rows:
+    _sec_items.append(("sector_us", us_rows, "no_us", "sector_pie_us"))
+if hk_rows:
+    _sec_items.append(("sector_hk", hk_rows, "no_hk", "sector_pie_hk"))
+if not _sec_items:
+    _sec_items = [("sector_tw", [], "no_tw", "sector_pie_tw"), ("sector_us", [], "no_us", "sector_pie_us")]
+_sec_cols = st.columns(len(_sec_items))
+for _sc, (_sk, _sr, _sek, _skey) in zip(_sec_cols, _sec_items):
+    with _sc:
+        if _sr:
+            st.plotly_chart(_make_sector_pie(_sr, t(_sk)), use_container_width=True, key=_skey)
+        else:
+            st.caption(t(_sek))
 
 # -- Dividend Records ----------------------------------------------------------
 st.markdown(f'<p class="section-title">{t("sec_dividend")}</p>', unsafe_allow_html=True)
@@ -1585,36 +1907,33 @@ def _make_div_df(subset_rows):
     )
 
 
-_div_col_tw, _div_col_us = st.columns(2)
-with _div_col_tw:
-    st.markdown(f"**{t('tw_stocks')}**")
-    if tw_rows:
-        st.dataframe(_make_div_df(tw_rows), use_container_width=True, hide_index=True)
-        _tw_ann_div = sum(
-            r["qty"] * ((_sd_info.get(r["sym"]) or {}).get("dividend_rate") or 0)
-            for r in tw_rows
-        )
-        if _tw_ann_div > 0:
-            st.caption(f"📌 {t('div_tw_total')}: TWD {_tw_ann_div:,.2f}")
-    else:
-        st.caption(t("no_tw"))
-with _div_col_us:
-    st.markdown(f"**{t('us_stocks')}**")
-    if us_rows:
-        st.dataframe(_make_div_df(us_rows), use_container_width=True, hide_index=True)
-        _us_ann_div = sum(
-            r["qty"] * ((_sd_info.get(r["sym"]) or {}).get("dividend_rate") or 0)
-            for r in us_rows
-        )
-        if _us_ann_div > 0:
-            st.caption(f"📌 {t('div_us_total')}: USD {_us_ann_div:,.2f}")
-    else:
-        st.caption(t("no_us"))
+_div_items = []
+if tw_rows:
+    _div_items.append(("tw_stocks", tw_rows, "no_tw", "div_tw_total", "TWD"))
+if us_rows:
+    _div_items.append(("us_stocks", us_rows, "no_us", "div_us_total", "USD"))
+if hk_rows:
+    _div_items.append(("hk_stocks", hk_rows, "no_hk", "div_hk_total", "HKD"))
+if not _div_items:
+    _div_items = [("tw_stocks", [], "no_tw", "div_tw_total", "TWD"), ("us_stocks", [], "no_us", "div_us_total", "USD")]
+_div_cols = st.columns(len(_div_items))
+for _divc, (_dlbl, _drows, _dek, _dtot_key, _dccy) in zip(_div_cols, _div_items):
+    with _divc:
+        st.markdown(f"**{t(_dlbl)}**")
+        if _drows:
+            st.dataframe(_make_div_df(_drows), use_container_width=True, hide_index=True)
+            _ann_div = sum(
+                r["qty"] * ((_sd_info.get(r["sym"]) or {}).get("dividend_rate") or 0)
+                for r in _drows
+            )
+            if _ann_div > 0:
+                st.caption(f"📌 {t(_dtot_key)}: {_dccy} {_ann_div:,.2f}")
+        else:
+            st.caption(t(_dek))
 
 # -- Portfolio Performance Chart ----------------------------------------------
 st.markdown(f'<p class="section-title">{t("sec_perf")}</p>', unsafe_allow_html=True)
 
-import json as _json
 _perf_period_opts = t("perf_period_opts")
 _perf_period_vals = t("perf_period_vals")
 _pp_col, _ = st.columns([2, 6])
@@ -1623,7 +1942,7 @@ with _pp_col:
                              format_func=lambda i: _perf_period_opts[i],
                              index=1, key="perf_period")
 _perf_str  = _perf_period_vals[_perf_idx]
-_holdings_json = _json.dumps(sorted(
+_holdings_json = json.dumps(sorted(
     [{"sym": r["sym"], "qty": r["qty"], "cost": r["cost"], "currency": r["currency"]}
      for r in rows],
     key=lambda x: x["sym"]
@@ -1634,7 +1953,7 @@ with st.spinner(t("perf_fetching")):
 if not _perf_data:
     st.caption(t("perf_no_data"))
 else:
-    _ccy_labels = {"TWD": t("perf_tw_label"), "USD": t("perf_us_label")}
+    _ccy_labels = {"TWD": t("perf_tw_label"), "USD": t("perf_us_label"), "HKD": t("perf_hk_label")}
     _perf_cols = st.columns(len(_perf_data))
     for _pidx, (_ccy, _pdata) in enumerate(_perf_data.items()):
         with _perf_cols[_pidx]:
@@ -1684,7 +2003,9 @@ else:
 
 # -- Transaction History -------------------------------------------------------
 st.markdown(f'<p class="section-title">{t("trans_history")}</p>', unsafe_allow_html=True)
-_txns = load_transactions(st.session_state.user_id)
+if "cached_txns" not in st.session_state:
+    st.session_state.cached_txns = load_transactions(st.session_state.user_id)
+_txns = st.session_state.cached_txns
 if not _txns:
     st.caption(t("trans_no_records"))
 else:
@@ -1730,6 +2051,7 @@ else:
                 st.session_state.portfolio = load_holdings(st.session_state.user_id)
                 st.session_state.cached_news = {}
                 st.session_state.news_portfolio_key = ""
+                st.session_state.pop("cached_txns", None)
                 st.success(t("trans_deleted"))
                 st.rerun()
 
@@ -1744,6 +2066,9 @@ def _thumb_html(article):
             (r["url"] for r in resolutions if r.get("width", 0) >= 200),
             resolutions[0]["url"],
         )
+        url = html_escape(url, quote=True)
+        if not url.startswith(("http://", "https://")):
+            raise ValueError
         return f'<img class="gn-thumb" src="{url}" alt="" loading="lazy">'
     except Exception:
         return '<div class="gn-thumb-placeholder">📄</div>'
@@ -1760,11 +2085,13 @@ def _render_news_tabs(syms, cached):
             articles = cached[sym]
             cards_html = ""
             for article in articles:
-                title  = (article.get("title") or "(no title)").replace("<", "&lt;").replace(">", "&gt;")
-                link   = article.get("link") or "#"
-                pub    = (article.get("publisher") or "").replace("<", "&lt;")
+                title  = html_escape(article.get("title") or "(no title)")
+                link   = html_escape(article.get("link") or "#", quote=True)
+                if not link.startswith(("http://", "https://")):
+                    link = "#"
+                pub    = html_escape(article.get("publisher") or "")
                 ts     = article.get("providerPublishTime")
-                dt_str = datetime.fromtimestamp(ts).strftime("%m/%d %H:%M") if ts else ""
+                dt_str = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8))).strftime("%m/%d %H:%M") if ts else ""
                 thumb  = _thumb_html(article)
                 cards_html += f"""
 <div class="gn-card">
@@ -1782,15 +2109,20 @@ def _render_news_tabs(syms, cached):
 if not st.session_state.cached_news:
     st.warning(t("news_not_found"))
 else:
-    tw_syms = [r["sym"] for r in tw_rows]
-    us_syms = [r["sym"] for r in us_rows]
-    news_col_tw, news_col_us = st.columns(2)
-    with news_col_tw:
-        st.markdown(t("news_tw"))
-        _render_news_tabs(tw_syms, st.session_state.cached_news)
-    with news_col_us:
-        st.markdown(t("news_us"))
-        _render_news_tabs(us_syms, st.session_state.cached_news)
+    _news_items = []
+    if tw_rows:
+        _news_items.append(("news_tw", [r["sym"] for r in tw_rows]))
+    if us_rows:
+        _news_items.append(("news_us", [r["sym"] for r in us_rows]))
+    if hk_rows:
+        _news_items.append(("news_hk", [r["sym"] for r in hk_rows]))
+    if not _news_items:
+        _news_items = [("news_tw", []), ("news_us", [])]
+    _news_cols = st.columns(len(_news_items))
+    for _nc, (_nk, _nsyms) in zip(_news_cols, _news_items):
+        with _nc:
+            st.markdown(t(_nk))
+            _render_news_tabs(_nsyms, st.session_state.cached_news)
 
 # -- Footer -------------------------------------------------------------------
 st.divider()
